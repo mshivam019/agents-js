@@ -4,6 +4,7 @@
 import { Plugin } from '@livekit/agents';
 
 export * from './models.js';
+export { OrderedSTT } from './ordered_stt.js';
 export {
   STT,
   SpeechStream,
