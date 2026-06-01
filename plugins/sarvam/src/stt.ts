@@ -744,6 +744,16 @@ export class SpeechStream extends stt.SpeechStream {
     };
 
     const listenTask = Task.from(async (controller) => {
+      // -------------------------------------------------------------------
+      // Speech-event ordering state
+      //
+      // Sarvam's WebSocket can deliver END_SPEECH before FINAL_TRANSCRIPT.
+      // We hold END_OF_SPEECH until a transcript arrives to prevent premature
+      // turn closure in the agent pipeline.
+      // -------------------------------------------------------------------
+      let pendingEndOfSpeech: stt.SpeechEvent | undefined;
+      let hasTranscriptForCurrentSpeech = false;
+
       const putMessage = (event: stt.SpeechEvent) => {
         if (!this.queue.closed) {
           try {
@@ -752,6 +762,15 @@ export class SpeechStream extends stt.SpeechStream {
             // ignore
           }
         }
+      };
+
+      const flushPendingEndOfSpeech = () => {
+        if (!pendingEndOfSpeech || this.queue.closed) {
+          return;
+        }
+        putMessage(pendingEndOfSpeech);
+        pendingEndOfSpeech = undefined;
+        hasTranscriptForCurrentSpeech = false;
       };
 
       const listenMessage = new Promise<void>((resolve, reject) => {
@@ -768,14 +787,25 @@ export class SpeechStream extends stt.SpeechStream {
               const signalType = eventData.signal_type;
 
               if (signalType === 'START_SPEECH') {
+                // Suppress spurious START while we hold a pending END.
+                if (pendingEndOfSpeech) {
+                  return;
+                }
                 if (!this.#speaking) {
                   this.#speaking = true;
+                  hasTranscriptForCurrentSpeech = false;
                   putMessage({ type: stt.SpeechEventType.START_OF_SPEECH });
                 }
               } else if (signalType === 'END_SPEECH') {
                 if (this.#speaking) {
                   this.#speaking = false;
-                  putMessage({ type: stt.SpeechEventType.END_OF_SPEECH });
+                  if (hasTranscriptForCurrentSpeech) {
+                    putMessage({ type: stt.SpeechEventType.END_OF_SPEECH });
+                    hasTranscriptForCurrentSpeech = false;
+                  } else {
+                    // Hold END_OF_SPEECH until a transcript arrives.
+                    pendingEndOfSpeech = { type: stt.SpeechEventType.END_OF_SPEECH };
+                  }
                 }
               }
             } else if (msgType === 'data') {
@@ -798,8 +828,14 @@ export class SpeechStream extends stt.SpeechStream {
               if (transcript) {
                 if (!this.#speaking) {
                   this.#speaking = true;
-                  putMessage({ type: stt.SpeechEventType.START_OF_SPEECH });
+                  hasTranscriptForCurrentSpeech = false;
+                  // Only emit START_OF_SPEECH if we're not holding a pending END.
+                  if (!pendingEndOfSpeech) {
+                    putMessage({ type: stt.SpeechEventType.START_OF_SPEECH });
+                  }
                 }
+
+                hasTranscriptForCurrentSpeech = true;
 
                 putMessage({
                   type: stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -814,6 +850,9 @@ export class SpeechStream extends stt.SpeechStream {
                     },
                   ],
                 });
+
+                // Flush any pending END_OF_SPEECH now that we have a transcript.
+                flushPendingEndOfSpeech();
               }
             } else if (msgType === 'error') {
               // Server format: { type: "error", data: { message: "...", code: "..." } }
